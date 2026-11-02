@@ -145,7 +145,8 @@ groups() ->
                         partitioned_publisher,
                         reconnect_consumer_and_publish,
                         reconnect_consumer_and_wait,
-                        reconnect_consumer_and_wait_channel_down
+                        reconnect_consumer_and_wait_channel_down,
+                        recreate_queue_during_partition
                        ]}
                      ]}
     ].
@@ -342,7 +343,8 @@ end_per_group(_, Config) ->
 init_per_testcase(Testcase, Config) when Testcase == partitioned_publisher;
                                          Testcase == reconnect_consumer_and_publish;
                                          Testcase == reconnect_consumer_and_wait;
-                                         Testcase == reconnect_consumer_and_wait_channel_down ->
+                                         Testcase == reconnect_consumer_and_wait_channel_down;
+                                         Testcase == recreate_queue_during_partition ->
     Config1 = rabbit_ct_helpers:testcase_started(Config, Testcase),
     Q = rabbit_data_coercion:to_binary(Testcase),
     Config2 = rabbit_ct_helpers:set_config(Config1,
@@ -442,7 +444,8 @@ merge_app_env(Config) ->
 end_per_testcase(Testcase, Config) when Testcase == partitioned_publisher;
                                         Testcase == reconnect_consumer_and_publish;
                                         Testcase == reconnect_consumer_and_wait;
-                                        Testcase == reconnect_consumer_and_wait_channel_down ->
+                                        Testcase == reconnect_consumer_and_wait_channel_down;
+                                        Testcase == recreate_queue_during_partition ->
     Config1 = rabbit_ct_helpers:run_steps(Config,
       rabbit_ct_client_helpers:teardown_steps() ++
       rabbit_ct_broker_helpers:teardown_steps()),
@@ -4135,6 +4138,91 @@ reconnect_consumer_and_wait_channel_down(Config) ->
     %% at this time!
     wait_for_messages_ready(Servers, RaName, 1),
     wait_for_messages_pending_ack(Servers, RaName, 0).
+
+recreate_queue_during_partition(Config) ->
+    [Server | _] = Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    %% make a queue
+    Ch0 = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    Args = [{<<"x-queue-type">>, longstr, <<"quorum">>}],
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0}, declare(Ch0, QQ, Args)),
+    RaName = ra_name(QQ),
+
+    %% suppose the queue has some election history
+    [trigger_elections_until_leader(RaName, Node) || _ <- lists:seq(1, 2), Node <- Servers],
+
+    {ok, _, {_, Leader}} = ra:members({RaName, Server}),
+    [Stale, Follower] = lists:delete(Leader, Servers),
+
+    %% for a clearer assertion, publish a message
+    ChStale = rabbit_ct_client_helpers:open_channel(Config, Stale),
+    #'confirm.select_ok'{} = amqp_channel:call(ChStale, #'confirm.select'{}),
+    ok = publish_confirm(ChStale, QQ),
+    wait_for_messages_ready(Servers, RaName, 1),
+
+    %% partition
+    rabbit_ct_broker_helpers:block_traffic_between(Stale, Leader),
+    rabbit_ct_broker_helpers:block_traffic_between(Stale, Follower),
+    await_disconnected(Stale, Leader),
+    await_disconnected(Stale, Follower),
+
+    %% recreate the queue
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Leader),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QQ}),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0}, declare(Ch, QQ, Args)),
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+
+    %% publish 10 messages
+    ConfirmedMsgs = 10,
+    publish_confirm_many(Ch, QQ, ConfirmedMsgs),
+    wait_for_messages_ready([Leader, Follower], RaName, ConfirmedMsgs),
+
+    %% heal
+    rabbit_ct_broker_helpers:allow_traffic_between(Stale, Follower),
+    await_connected(Stale, Follower),
+    _ = rpc:call(Stale, ra, trigger_election, [{RaName, Stale}]),
+    rabbit_ct_broker_helpers:allow_traffic_between(Stale, Leader),
+    await_connected(Stale, Leader),
+    await_leader_convergence(RaName, Servers),
+
+    %% assert that 10 messages are still ready
+    {ok, {_, ReadyMsgs}, _} = ra:leader_query({RaName, Follower},
+                                              {rabbit_fifo, query_messages_ready, []}),
+    ?assertEqual(ConfirmedMsgs, ReadyMsgs).
+
+trigger_elections_until_leader(RaName, Node) ->
+    ServerId = {RaName, Node},
+    ?awaitMatch({ok, _, ServerId},
+                case ra:members(ServerId) of
+                    {ok, _, ServerId} = Members ->
+                        Members;
+                    Other ->
+                        _ = rpc:call(Node, ra, trigger_election, [ServerId]),
+                        Other
+                end,
+                ?DEFAULT_AWAIT).
+
+await_leader_convergence(RaName, Nodes) ->
+    rabbit_ct_helpers:await_condition(
+      fun() ->
+              Leaders = [Leader || Node <- Nodes,
+                                   {ok, _, Leader} <- [catch ra:members({RaName, Node}, 1000)]],
+              length(Leaders) =:= length(Nodes) andalso
+                  length(lists:usort(Leaders)) =:= 1
+      end, 30000).
+
+await_disconnected(Node, Peer) ->
+    rabbit_ct_helpers:await_condition(
+      fun() ->
+              not lists:member(Peer, erpc:call(Node, erlang, nodes, []))
+      end, 30000).
+
+await_connected(Node, Peer) ->
+    rabbit_ct_helpers:await_condition(
+      fun() ->
+              true =:= erpc:call(Node, net_kernel, connect_node, [Peer])
+      end, 30000).
 
 delete_immediately_by_resource(Config) ->
     Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
