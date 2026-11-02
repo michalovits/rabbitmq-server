@@ -361,15 +361,18 @@ start_cluster(Q) ->
         rabbit_queue_location:select_leader_and_followers(Q, QuorumSize),
     LeaderId = {RaName, LeaderNode},
     NewQ0 = amqqueue:set_pid(Q, LeaderId),
+    ClusterUId = ra:new_uid(ra_lib:to_binary(RaName)),
     NewQ1 = case rabbit_feature_flags:is_enabled(track_qq_members_uids) of
                 false ->
                     amqqueue:set_type_state(NewQ0,
-                                            #{nodes => [LeaderNode | FollowerNodes]});
+                                            #{nodes => [LeaderNode | FollowerNodes],
+                                              cluster_uid => ClusterUId});
                 true ->
                     UIDs = #{Node => ra:new_uid(ra_lib:to_binary(RaName))
                              || Node <- [LeaderNode | FollowerNodes]},
                     amqqueue:set_type_state(NewQ0,
-                                            #{nodes => UIDs})
+                                            #{nodes => UIDs,
+                                              cluster_uid => ClusterUId})
             end,
 
     Versions = [V || {ok, V} <- erpc:multicall(FollowerNodes,
@@ -1122,18 +1125,20 @@ delete(Q, _IfUnused, _IfEmpty, ActingUser) when ?amqqueue_is_quorum(Q) ->
     rabbit_binding:delete_for_destination(QName, ActingUser),
     {ok, ReadyMsgs, _} = stat(Q),
     Servers = [{Name, Node} || Node <- QNodes],
-    case ra:delete_cluster(Servers, Timeout) of
+    ClusterUId = cluster_uid(Q),
+    case ra:delete_cluster(Servers, Timeout, ClusterUId) of
         {ok, {_, LeaderNode} = Leader} ->
             MRef = erlang:monitor(process, Leader),
             receive
                 {'DOWN', MRef, process, _, _} ->
                     %% leader is down,
                     %% force delete remaining members
-                    ok = force_delete_queue(lists:delete(Leader, Servers)),
+                    ok = force_delete_queue(lists:delete(Leader, Servers),
+                                            ClusterUId),
                     ok
             after Timeout ->
                     erlang:demonitor(MRef, [flush]),
-                    ok = force_delete_queue(Servers)
+                    ok = force_delete_queue(Servers, ClusterUId)
             end,
             notify_decorators(QName, shutdown),
             case delete_queue_data(Q, ActingUser) of
@@ -1172,7 +1177,7 @@ delete(Q, _IfUnused, _IfEmpty, ActingUser) when ?amqqueue_is_quorum(Q) ->
                        " online to reach a quorum: ~255p."
                        " Attempting force delete.",
                       [rabbit_misc:rs(QName), Errs]),
-                    ok = force_delete_queue(Servers),
+                    ok = force_delete_queue(Servers, ClusterUId),
                     notify_decorators(QName, shutdown)
             end,
             case delete_queue_data(Q, ActingUser) of
@@ -1183,9 +1188,9 @@ delete(Q, _IfUnused, _IfEmpty, ActingUser) when ?amqqueue_is_quorum(Q) ->
             end
     end.
 
-force_delete_queue(Servers) ->
+force_delete_queue(Servers, ClusterUId) ->
     [begin
-         case try ra:force_delete_server(?RA_SYSTEM, S)
+         case try ra:force_delete_server(?RA_SYSTEM, S, infinity, ClusterUId)
               catch _:E -> {error, E}
               end of
              ok -> ok;
@@ -2442,6 +2447,7 @@ make_ra_conf(Q, ServerId, TickTimeout,
                major_compaction_strategy => {num_minors, 32}},
     rabbit_misc:maps_put_truthy(membership, Membership,
                                 #{cluster_name => ClusterName,
+                                  cluster_uid => cluster_uid(Q),
                                   id => ServerId,
                                   uid => UId,
                                   friendly_name => FName,
@@ -2455,6 +2461,9 @@ make_ra_conf(Q, ServerId, TickTimeout,
                                   machine => RaMachine,
                                   initial_machine_version => MacVersion,
                                   ra_event_formatter => Formatter}).
+
+cluster_uid(Q) ->
+    maps:get(cluster_uid, amqqueue:get_type_state(Q), undefined).
 
 make_mutable_config(Q) ->
     QName = amqqueue:get_name(Q),

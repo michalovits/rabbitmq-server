@@ -1924,8 +1924,18 @@ internal_delete(Queue, ActingUser, Reason) ->
                          Pattern = amqqueue:pattern_match_on_exclusive_owner(Owner),
                          [#if_data_matches{pattern = Pattern}]
                  end,
+    IncarnationConditions =
+        case amqqueue:get_type_state(Queue) of
+            #{cluster_uid := ClusterUId} ->
+                TypeStatePattern = amqqueue:pattern_match_on_type_state(
+                                     #{cluster_uid => ClusterUId}),
+                [#if_data_matches{pattern = TypeStatePattern}];
+            _ ->
+                []
+        end,
     OnlyDurable = Reason =:= missing_owner,
-    case rabbit_db_queue:delete_if(QueueName, Conditions, OnlyDurable) of
+    case rabbit_db_queue:delete_if(QueueName, IncarnationConditions ++ Conditions,
+                                   OnlyDurable) of
         ok ->
             ok;
         {error, timeout} = Err ->
